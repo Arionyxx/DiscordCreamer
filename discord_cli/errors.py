@@ -6,6 +6,10 @@ class ConfigurationError(DiscordCliError):
     """Raised when the provided configuration is invalid."""
 
 
+class AuthenticationError(DiscordCliError):
+    """Raised when Discord authentication fails."""
+
+
 class DiscordOperationError(DiscordCliError):
     """Raised when an operation against Discord's API fails."""
 

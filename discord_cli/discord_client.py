@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import aiohttp
 import discord
 
 from .config import ServerRequest, SessionConfig
@@ -175,14 +177,186 @@ class DiscordProvisioner:
 
     async def _authenticate(self) -> None:
         self._progress.step("Authenticating with Discord...")
+        original_token = self._config.token
+        token, notes = self._normalize_token(original_token)
+        if not token:
+            raise AuthenticationError("Discord token cannot be empty after normalization.")
+        if token != original_token:
+            self._progress.debug("Token value was normalized before authentication.")
+        self._config.token = token
+        if notes:
+            for note in notes:
+                self._progress.debug(f"Token normalization: {note}.")
+        else:
+            self._progress.debug("Token normalization: no changes applied.")
+        if token.lower().startswith("bot "):
+            self._progress.debug("Warning: token still contains a 'Bot ' prefix after normalization.")
+        else:
+            self._progress.debug("Confirmed token will be used without a 'Bot ' prefix.")
+        self._progress.debug("Attempting authentication...")
+        self._progress.debug(self._token_format_message(token))
+        if self._token_contains_whitespace(token):
+            self._progress.debug("Token still contains internal whitespace characters.")
+        ascii_message = (
+            "Token characters: ASCII only."
+            if self._is_ascii(token)
+            else "Token contains non-ASCII characters; using the provided value as-is."
+        )
+        self._progress.debug(ascii_message)
+        await self._validate_token_with_rest(token)
         try:
-            await self._client.login(self._config.token)
+            self._progress.debug("Using discord.py-self client.login(...) for authentication.")
+            await self._client.login(token)
+            self._progress.debug("discord.py-self login coroutine completed without raising.")
         except discord.LoginFailure as exc:
+            self._progress.debug(f"discord.py-self reported LoginFailure: {exc}")
             raise AuthenticationError(
                 "Discord rejected the provided token. Please verify it and try again."
             ) from exc
         except discord.HTTPException as exc:
+            self._log_http_exception(exc, context="discord.py-self login")
             raise self._build_authentication_error(exc) from exc
+
+    async def _validate_token_with_rest(self, token: str) -> None:
+        endpoint = "https://discord.com/api/v10/users/@me"
+        self._progress.debug(f"API endpoint: GET {endpoint}")
+        headers = self._build_validation_headers(token)
+        masked_headers = self._mask_headers(headers, token)
+        self._progress.debug(f"Request headers: {masked_headers}")
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(endpoint, headers=headers) as response:
+                    status = response.status
+                    self._progress.debug(f"Response status: {status}")
+                    body_text = await response.text()
+                    formatted_body = self._format_response_body(body_text)
+                    self._progress.debug(f"Response body: {formatted_body}")
+                    if status == 200:
+                        self._progress.debug("Token validation succeeded with /users/@me.")
+                    else:
+                        self._progress.debug(
+                            "Token validation did not return HTTP 200; proceeding with discord.py-self login."
+                        )
+        except asyncio.TimeoutError:
+            self._progress.debug("Token validation request timed out.")
+        except aiohttp.ClientError as exc:
+            self._progress.debug(
+                f"Token validation request failed: {exc.__class__.__name__}: {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._progress.debug(
+                f"Token validation encountered an unexpected error: {exc.__class__.__name__}: {exc}"
+            )
+
+    def _build_validation_headers(self, token: str) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Authorization": token,
+            "Accept": "application/json",
+        }
+        http_client = getattr(self._client, "http", None)
+        user_agent = None
+        if http_client is not None:
+            user_agent = getattr(http_client, "user_agent", None)
+            if callable(user_agent):
+                user_agent = user_agent()
+        if not user_agent:
+            user_agent = "discord.py-self (cli validation)"
+        headers["User-Agent"] = user_agent
+        return headers
+
+    def _mask_headers(self, headers: Dict[str, str], token: str) -> Dict[str, str]:
+        masked = dict(headers)
+        if "Authorization" in masked:
+            masked["Authorization"] = self._mask_token(token)
+        return masked
+
+    def _format_response_body(self, body: str) -> str:
+        if not body:
+            return "<empty>"
+        stripped = body.strip()
+        if not stripped:
+            return "<empty>"
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            formatted = stripped
+        else:
+            formatted = json.dumps(parsed, indent=2, sort_keys=True)
+        if len(formatted) > 1000:
+            return f"{formatted[:1000]}... [truncated]"
+        return formatted
+
+    @staticmethod
+    def _normalize_token(token: str) -> Tuple[str, List[str]]:
+        notes: List[str] = []
+        original = token or ""
+        working = original.strip()
+        if working != original:
+            notes.append("trimmed leading/trailing whitespace")
+        if len(working) >= 2 and working[0] == working[-1] and working[0] in {'"', "'"}:
+            notes.append("removed surrounding quotes")
+            working = working[1:-1].strip()
+        after_quote_strip = working.strip("'\"")
+        if after_quote_strip != working:
+            notes.append("removed stray edge quotes")
+            working = after_quote_strip
+        collapsed = working.replace("\n", "").replace("\r", "")
+        if collapsed != working:
+            notes.append("removed newline characters")
+            working = collapsed
+        if working.lower().startswith("bot "):
+            notes.append("removed 'Bot ' prefix")
+            working = working[4:].lstrip()
+        zero_width_space = "\u200b"
+        if zero_width_space in working:
+            notes.append("removed zero-width space characters")
+            working = working.replace(zero_width_space, "")
+        return working, notes
+
+    def _token_format_message(self, token: str) -> str:
+        return f"Token format: {self._mask_token(token)} (masked, length: {len(token)})"
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        if not token:
+            return "<empty>"
+        if len(token) <= 2:
+            return "*" * len(token)
+        if len(token) <= 8:
+            return f"{token[0]}***{token[-1]}"
+        return f"{token[:3]}...{token[-3:]}"
+
+    @staticmethod
+    def _token_contains_whitespace(token: str) -> bool:
+        return any(ch.isspace() for ch in token)
+
+    @staticmethod
+    def _is_ascii(token: str) -> bool:
+        try:
+            token.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        return True
+
+    def _log_http_exception(self, exc: discord.HTTPException, *, context: str) -> None:
+        status = exc.status
+        response = getattr(exc, "response", None)
+        url = getattr(response, "url", None)
+        if url:
+            self._progress.debug(f"{context} HTTPException status={status} url={url}")
+        else:
+            self._progress.debug(f"{context} HTTPException status={status}")
+        text = getattr(exc, "text", None)
+        if text:
+            self._progress.debug(
+                f"{context} response body: {self._format_response_body(text)}"
+            )
+        if response is not None and getattr(response, "headers", None) is not None:
+            headers = {k: v for k, v in response.headers.items()}
+            if "Authorization" in headers:
+                headers["Authorization"] = self._mask_token(headers["Authorization"])
+            self._progress.debug(f"{context} response headers: {headers}")
 
     def _build_authentication_error(self, exc: discord.HTTPException) -> AuthenticationError:
         status = exc.status

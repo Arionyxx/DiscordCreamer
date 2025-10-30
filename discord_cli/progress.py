@@ -17,6 +17,9 @@ class ProgressPrinter:
         print(f"[{self._timestamp()}] {message}")
         self._last_message = message
 
+    def debug(self, message: str) -> None:
+        self.info(f"[DEBUG] {message}")
+
     def step(self, message: str) -> None:
         self.info(f"➡️  {message}")
 

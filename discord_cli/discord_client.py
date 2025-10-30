@@ -176,7 +176,7 @@ class DiscordProvisioner:
     async def _authenticate(self) -> None:
         self._progress.step("Authenticating with Discord...")
         try:
-            await self._client.login(self._config.token, bot=False)
+            await self._client.login(self._config.token)
         except discord.LoginFailure as exc:
             raise AuthenticationError(
                 "Discord rejected the provided token. Please verify it and try again."

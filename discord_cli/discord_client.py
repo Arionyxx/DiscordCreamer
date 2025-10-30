@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import List, Optional
 
 import discord
 
 from .config import ServerRequest, SessionConfig
-from .errors import DiscordOperationError
+from .errors import AuthenticationError, DiscordOperationError
 from .invitations import InvitationManager
 from .progress import ProgressPrinter
 from .utils import with_rate_limit_retry
@@ -160,10 +161,85 @@ class DiscordProvisioner:
 
     async def execute(self) -> List[ServerProvisionResult]:
         try:
-            await self._client.start(self._config.token, reconnect=False)
+            await self._authenticate()
+            await self._client.connect(reconnect=False)
         finally:
-            if self._webhook:
-                await self._webhook.close()
+            try:
+                await self._client.close()
+            finally:
+                if self._webhook:
+                    await self._webhook.close()
         if self._client.exception:
             raise self._client.exception
         return self._client.results
+
+    async def _authenticate(self) -> None:
+        self._progress.step("Authenticating with Discord...")
+        try:
+            await self._client.login(self._config.token, bot=False)
+        except discord.LoginFailure as exc:
+            raise AuthenticationError(
+                "Discord rejected the provided token. Please verify it and try again."
+            ) from exc
+        except discord.HTTPException as exc:
+            raise self._build_authentication_error(exc) from exc
+
+    def _build_authentication_error(self, exc: discord.HTTPException) -> AuthenticationError:
+        status = exc.status
+        if status == 401:
+            message = "Discord rejected the provided token. Please verify it and try again."
+        elif status == 403:
+            message = (
+                "Discord denied the login attempt. Your account may require additional "
+                "verification or is currently locked by Discord."
+            )
+        elif status == 429:
+            retry_after = self._retry_after_from_exception(exc)
+            if retry_after is not None:
+                if retry_after >= 1:
+                    seconds = max(1, int(round(retry_after)))
+                    message = (
+                        "Discord is rate limiting authentication attempts. "
+                        f"Please wait {seconds} seconds before trying again."
+                    )
+                else:
+                    message = (
+                        "Discord is rate limiting authentication attempts. "
+                        "Please wait a moment before trying again."
+                    )
+            else:
+                message = (
+                    "Discord is rate limiting authentication attempts. Please try again later."
+                )
+        else:
+            detail = (exc.text or "").strip()
+            if detail:
+                message = f"Failed to authenticate with Discord (HTTP {status}): {detail}"
+            else:
+                message = f"Failed to authenticate with Discord (HTTP {status})."
+        return AuthenticationError(message)
+
+    @staticmethod
+    def _retry_after_from_exception(exc: discord.HTTPException) -> Optional[float]:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            retry_header = response.headers.get("Retry-After")
+            if retry_header:
+                try:
+                    return float(retry_header)
+                except (TypeError, ValueError):
+                    pass
+        text = getattr(exc, "text", None)
+        if text:
+            try:
+                data = json.loads(text)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(data, dict):
+                retry_after_value = data.get("retry_after")
+                if retry_after_value is not None:
+                    try:
+                        return float(retry_after_value)
+                    except (TypeError, ValueError):
+                        return None
+        return None
